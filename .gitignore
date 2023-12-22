@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# models
+*.tar
+.mistral-7B-v0.1/
+mistral-7B-v0.1/
+._mistral-7B-v0.1
+
 # C extensions
 *.so
 

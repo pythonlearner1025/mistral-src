@@ -41,6 +41,8 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
     seqlens = [len(x) for x in encoded_prompts]
 
     # Cache
+    # TODO what is cache window
+    # TODO how does cache work
     cache_window = max(seqlens) + max_tokens
     if model.args.sliding_window is not None and cache_window > model.args.sliding_window:
         cache_window = model.args.sliding_window
@@ -67,8 +69,12 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
     for s in range(0, max_prompt_len, chunk_size):
         prompt_chunks = [p[s:s+chunk_size] for p in encoded_prompts]
         assert all(len(p) > 0 for p in prompt_chunks)
+        assert B == len(seq_len) == len(prompts)
+        # x will be reshaped to [B, chunk_size] in model
+        x = torch.tensor(sum(prompt_chunks,[]), device=model.device, dtype=torch.long)
+        (num_toks,) = x.shape
         prelogits = model.forward(
-            torch.tensor(sum(prompt_chunks, []), device=model.device, dtype=torch.long),
+            x,
             seqlens=[len(p) for p in prompt_chunks],
             cache=cache
         )
@@ -82,12 +88,17 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
 
         offset = 0
         for i_seq, sequence in enumerate(prompt_chunks):
+            # get the probs of each seq
             logprobs[i_seq].extend([logits[offset + i, sequence[i + 1]].item() for i in range(len(sequence) - 1)])
             offset += len(sequence)
 
+        # for all batches
+        assert prelogits.shape == (num_toks,V)
+        # select last tok for all prompts
         last_token_prelogits = prelogits.index_select(0, torch.tensor([len(p) for p in prompt_chunks], device=prelogits.device).cumsum(dim=0) - 1)
         assert last_token_prelogits.shape == (B, V)
-
+    
+    # TODO implement streaming 
     # decode
     generated_tokens = []
     assert last_token_prelogits is not None
@@ -99,6 +110,8 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
             logprobs[i].append(last_token_logits[i, next_token[i]].item())
 
         generated_tokens.append(next_token[:, None])
+        # if i_token == 0, next_token == last tok of prompt
+        # cache contains k,v context of all prompts 
         last_token_prelogits = model.forward(next_token, seqlens=[1] * len(prompts), cache=cache)
         assert last_token_prelogits.shape == (B, V)
 

@@ -62,10 +62,11 @@ class Attention(nn.Module):
         super().__init__()
         self.args = args
 
-        self.n_heads: int = args.n_heads
-        self.head_dim: int = args.head_dim
-        self.n_kv_heads: int = args.n_kv_heads
+        self.n_heads: int = args.n_heads # 32
+        self.head_dim: int = args.head_dim # 128
+        self.n_kv_heads: int = args.n_kv_heads # 8
 
+        # self.repeats == # heads in multihead attention
         self.repeats = self.n_heads // self.n_kv_heads
 
         self.scale = self.args.head_dim**-0.5
@@ -81,7 +82,9 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         cache: Optional[CacheView],
     ) -> torch.Tensor:
-        seqlen_sum, _ = x.shape
+        # at enc, seqlen_sum == num_toks (all combined)
+        seqlen_sum, h = x.shape
+        assert h == self.args.dim
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
@@ -91,10 +94,13 @@ class Attention(nn.Module):
 
         if cache is None:
             key, val = xk, xv
+        # enc
         elif cache.prefill:
             key, val = cache.interleave_kv(xk, xv)
             cache.update(xk, xv)
+        # dec
         else:
+            assert seqlen_sum == 1
             cache.update(xk, xv)
             key, val = cache.key, cache.value
             key = key.view(
@@ -109,11 +115,13 @@ class Attention(nn.Module):
 
         # xformers requires (B=1, S, H, D)
         xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
+        # TODO xla can't compile this, implement fast attention? 
         output = memory_efficient_attention(
             xq, key, val, None if cache is None else cache.mask
         )
-
-        return self.wo(output.view(seqlen_sum, self.n_heads * self.head_dim))
+        assert self.n_heads * self.heads_dim == self.args.dim # 4096
+        out = self.wo(output.view(seqlen_sum, self.n_heads * self.head_dim))
+        return out # (num_toks, self.args.dim)
 
 
 class FeedForward(nn.Module):
@@ -169,6 +177,7 @@ class TransformerBlock(nn.Module):
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
         out = h + r
+        # out.shape == [num_toks, args.dim]
         return out
 
 
@@ -257,6 +266,7 @@ class Transformer(nn.Module):
         if self.pipeline_rank == 0:
             assert self.tok_embeddings is not None
             h = self.tok_embeddings(input_ids)
+            assert h.shape == [num_toks, self.args.dim]
         else:
             h = torch.empty(
                 num_toks, self.args.dim, device=self.device, dtype=self.dtype
@@ -281,7 +291,8 @@ class Transformer(nn.Module):
         else:
             # Last rank has a final normalization step.
             assert self.norm is not None
-            return self.norm(h)
+            out = self.norm(h)
+            return out
 
     def forward(
         self,
@@ -299,6 +310,7 @@ class Transformer(nn.Module):
         else:
             assert self.output is not None
             outs = self.output(h)
+            #assert out.shape == [num_toks, self.args.vocab_size]
         if self.num_pipeline_ranks > 1:
             torch.distributed.broadcast(outs, src=self.num_pipeline_ranks - 1)
         return outs.float()
