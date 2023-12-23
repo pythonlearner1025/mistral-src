@@ -8,6 +8,12 @@ from pathlib import Path
 from mistral.model import Transformer
 from mistral.tokenizer import Tokenizer
 
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
+
+from mistral.xla_model_parallel import get_model_parallel_rank, get_model_parallel_world_size
+from typing import *
+import re
 
 def sample_top_p(probs: torch.Tensor, p: float):
     assert 0 <= p <= 1
@@ -31,7 +37,7 @@ def sample(logits: torch.Tensor, temperature: float, top_p: float):
     return next_token.reshape(-1)
 
 
-@torch.inference_mode()
+@torch.no_grad() # TODO set to no_grad
 def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, max_tokens: int,  temperature: float, chunk_size: int = None):
     model = model.eval()
     B, V = len(prompts), model.args.vocab_size
@@ -51,10 +57,12 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
         model.args.max_batch_size,
         cache_window,
         model.args.n_kv_heads,
+        model.args.n_heads,
         model.args.head_dim,
     )
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
+    xm.mark_step()
     
     # Bookkeeping
     logprobs = [[] for _ in range(B)]
@@ -69,16 +77,18 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
     for s in range(0, max_prompt_len, chunk_size):
         prompt_chunks = [p[s:s+chunk_size] for p in encoded_prompts]
         assert all(len(p) > 0 for p in prompt_chunks)
-        assert B == len(seq_len) == len(prompts)
+        assert B == len(seqlens) == len(prompts)
         # x will be reshaped to [B, chunk_size] in model
         x = torch.tensor(sum(prompt_chunks,[]), device=model.device, dtype=torch.long)
         (num_toks,) = x.shape
+
         prelogits = model.forward(
             x,
             seqlens=[len(p) for p in prompt_chunks],
             cache=cache
         )
         logits = torch.log_softmax(prelogits, dim=-1)
+        xm.mark_step()
 
         if last_token_prelogits is not None:
             # Pass > 1
@@ -103,6 +113,7 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
     generated_tokens = []
     assert last_token_prelogits is not None
     for i_token in range(max_tokens):
+        xm.master_print(f'generating {i_token}')
         next_token = sample(last_token_prelogits, temperature=temperature, top_p=0.8)
 
         last_token_logits = torch.log_softmax(last_token_prelogits, dim=-1)
@@ -111,8 +122,10 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
 
         generated_tokens.append(next_token[:, None])
         # if i_token == 0, next_token == last tok of prompt
-        # cache contains k,v context of all prompts 
+        # cache contains K,V context of all prompts 
+        # next_tok is used as Q
         last_token_prelogits = model.forward(next_token, seqlens=[1] * len(prompts), cache=cache)
+        xm.mark_step()
         assert last_token_prelogits.shape == (B, V)
 
     generated_words = []
@@ -123,13 +136,25 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
 
     return generated_words, logprobs
 
+def setup_model_parallel() -> Tuple[int, int]:
+    # assuming model parallelism over the whole world size
+    rank = get_model_parallel_rank()
+    world_size = get_model_parallel_world_size()
 
-def interactive(model_path: str, max_tokens: int = 35, temperature: float = 0.7, instruct: bool = False):
+    # seed must be the same in all processes
+    torch.manual_seed(1)
+    device = xm.xla_device()
+    xm.set_rng_state(1, device=device)
+    return rank, world_size
+
+def interactive(model_path: str = '/home/minjunes/mistral-src/mistral-7B-v0.1', max_tokens: int = 35, temperature: float = 0.7, instruct: bool = False):
+    rank, world_size = setup_model_parallel()
+    device = xm.xla_device()
     tokenizer = Tokenizer(str(Path(model_path) / "tokenizer.model"))
-    transformer = Transformer.from_folder(Path(model_path), max_batch_size=3)
+    transformer = Transformer.from_folder(Path(model_path), rank, world_size, max_batch_size=3, device=device)
 
     while True:
-        prompt = input("Prompt: ")
+        prompt = 'what is the meaning of life?'#input("Prompt: ")
         if instruct:
             prompt = f"[INST] {prompt} [/INST]"
         res, _logprobs = generate(
@@ -142,21 +167,17 @@ def interactive(model_path: str, max_tokens: int = 35, temperature: float = 0.7,
         print(res[0])
         print("=====================")
 
-
-def demo(
-    model_path: str, max_tokens: int = 35, temperature: float = 0, num_pipeline_ranks=1
-):
-    if num_pipeline_ranks > 1:
-        torch.distributed.init_process_group()
-        torch.cuda.set_device(torch.distributed.get_rank())
-        should_print = torch.distributed.get_rank() == 0
-    else:
-        should_print = True
+def _accelerate(idx,  model_path: str = '/home/minjunes/mistral-src/mistral-7B-v0.1', max_tokens: int = 35, temperature: float = 0, num_pipeline_ranks : int =1):
+    rank, world_size = setup_model_parallel()
+    #weights = load_split_weights(model_path, world_size)
+    device = xm.xla_device()
+    xm.master_print("tokenizing")
     tokenizer = Tokenizer(str(Path(model_path) / "tokenizer.model"))
+    xm.master_print("loading transformer")
     transformer = Transformer.from_folder(
-        Path(model_path), max_batch_size=3, num_pipeline_ranks=num_pipeline_ranks
-    )
-
+        Path(model_path), rank, world_size, max_batch_size=3, device=device, dtype=torch.bfloat16
+        )
+    xm.master_print("generating")
     res, _logprobs = generate(
         [
             "This is a test",
@@ -168,14 +189,49 @@ def demo(
         max_tokens=max_tokens,
         temperature=temperature,
     )
-    if should_print:
-        for x,l in zip(res, _logprobs):
-            print(x)
-            logging.debug('Logprobs: %s',l)
-            print("=====================")
+    for x,l in zip(res, _logprobs):
+        xm.master_print(x)
+        logging.debug('Logprobs: %s',l)
+        xm.master_print("=====================")
+
+def load_split_weights(folder, world_size):
+    loaded = torch.load(str(Path(folder) / "consolidated.00.pth"), 
+                map_location='cpu')
+    split_dims = {
+        'tok_embeddings.weight': -1,
+        'output.weight': -2,
+        '(wq|wk|wv).weight': -2,
+        'wo.weight': -1,
+        'w1.weight': -2,
+        'w2.weight': -1,
+        'w3.weight': -2,
+    }
+    res = [dict() for _ in range(world_size)]
+    for key, value in loaded.items():
+        split_dim = None
+        for pattern, dim in split_dims.items():
+            if re.search(pattern, key):
+                split_dim = dim
+                break
+        if split_dim is not None:
+            split_size = value.size(split_dim) // world_size
+            split_tensors = value.split(split_size, dim=split_dim)
+            for i, split_tensor in enumerate(split_tensors):
+                #xm.master_print(f'{key} {split_tensor.shape}')
+                assert split_tensor.shape[split_dim] == split_size
+                res[i][key] = split_tensor
+        else:
+            for i in range(world_size):
+                res[i][key] = value
+    return res
+
+def mp_main(model_path: str = '/home/minjunes/mistral-src/mistral-7B-v0.1', max_tokens: int = 35, temperature: float = 0, num_pipeline_ranks=1):
+    xmp.spawn(_accelerate, args=(model_path, max_tokens,temperature,num_pipeline_ranks))
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    fire.Fire(mp_main)
+    exit(-1)
     fire.Fire({
         "interactive": interactive,
         "demo": demo,

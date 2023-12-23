@@ -1,14 +1,14 @@
 import torch
 from typing import List, Tuple
 from dataclasses import dataclass
+import torch_xla.core.xla_model as xm
 
-from xformers.ops.fmha.attn_bias import (
+from .mask_utils import (
     AttentionBias,
     BlockDiagonalCausalMask,
     BlockDiagonalCausalWithOffsetPaddedKeysMask,
     BlockDiagonalMask,
 )
-
 
 @dataclass
 class RotatingCacheInputMetadata:
@@ -26,7 +26,6 @@ class RotatingCacheInputMetadata:
     prefill: bool
     mask: AttentionBias
     seqlens: List[int]
-
 
 def interleave_list(l1: List[torch.Tensor], l2: List[torch.Tensor]):
     assert len(l1) == len(l2)
@@ -127,7 +126,7 @@ class RotatingBufferCache:
     This is an example that implements a less naive rotating buffer cache, allowing for variable length sequences.
     Allocated cache is rectangular which is wasteful (see PagedAttention for better mechanisms)
     """
-    def __init__(self, n_layers: int, max_batch_size: int, sliding_window: int, n_kv_heads: int, head_dim: int):
+    def __init__(self, n_layers: int, max_batch_size: int, sliding_window: int, n_kv_heads: int, n_heads: int, head_dim: int):
 
         self.sliding_window = sliding_window
         self.n_kv_heads = n_kv_heads
@@ -149,6 +148,8 @@ class RotatingBufferCache:
         ))
         # holds the valid length for each batch element in the cache
         self.kv_seqlens = None
+        self.n_heads = n_heads
+        self.head_dim = head_dim
 
     def get_view(self, layer_id: int, metadata: RotatingCacheInputMetadata) -> CacheView:
         return CacheView(self.cache_k[layer_id], self.cache_v[layer_id], metadata, self.kv_seqlens)
@@ -198,9 +199,6 @@ class RotatingBufferCache:
             for seqlen in seqlens
         ]
         
-        # during decode step, only allow attention up to self pos 
-        # presumably in cache, mask allows for attention up till pos at -W from self pos 
-        assert sum(seqpos)> 0 or masks == [[True]] * len(seqlens)
         
         # [True] * sum(seqlens)
         to_cache_mask = torch.tensor(sum(masks, []), device=self.device, dtype=torch.bool)
@@ -213,24 +211,30 @@ class RotatingBufferCache:
         batch_idx = torch.tensor(sum([[i]*seqlen for i, seqlen in enumerate(seqlens)], []), device=self.device, dtype=torch.long)
         # len(cache[0]) == len(seqlens) * self.sliding_window
         cache_positions = positions % self.sliding_window + batch_idx * self.sliding_window
-        
 
         first_prefill = seqpos[0] == 0
         subsequent_prefill = any(seqlen > 1 for seqlen in seqlens)
-        # first encoding
+
+        # TODO how slow is mask.materialize and can it be optimized? 
         if first_prefill:
             assert all([pos == 0 for pos in seqpos]), (seqpos)
             mask = BlockDiagonalCausalMask.from_seqlens(seqlens).make_local_attention(self.sliding_window)
+            shape = (self.n_heads, sum(seqlens), sum(seqlens))
+            xm.master_print(f'seqlens {sum(seqlens)}')
+            mask = mask.materialize(shape, device=self.device, dtype=torch.bfloat16)
+            xm.master_print(f'made mask shape {mask.shape}')
+
         # subsequent encodings
         elif subsequent_prefill:
             mask = BlockDiagonalMask.from_seqlens(
                 q_seqlen=seqlens,
                 kv_seqlen=[s + cached_s.clamp(max=self.sliding_window).item() for (s, cached_s) in zip(seqlens, self.kv_seqlens)]
             ).make_local_attention_from_bottomright(self.sliding_window)
+            shape = (self.n_heads, self.n_kv_heads, sum(seqlens))
+            mask = mask.materialize(shape, device=self.device, dtype=torch.bfloat16)
         # decoding
         else:
             assert all([n_seq == 1 for n_seq in seqlens]), (seqlens)
-            # TODO what does BlockDiagonalMask do? 
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
                 q_seqlen=seqlens,
                 # upper bound for each individual key len
@@ -238,6 +242,8 @@ class RotatingBufferCache:
                                             # inc by 1              # max seq size == W (4096)
                 kv_seqlen=(self.kv_seqlens + cached_elements).clamp(max=self.sliding_window).tolist()
             )
+            shape = (self.n_heads, self.n_kv_heads, sum(seqlens))
+            mask = mask.materialize(shape, device=self.device, dtype=torch.bfloat16)
 
         return RotatingCacheInputMetadata(
             positions=positions,
