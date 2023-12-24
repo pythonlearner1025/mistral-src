@@ -52,14 +52,17 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
     cache_window = max(seqlens) + max_tokens
     if model.args.sliding_window is not None and cache_window > model.args.sliding_window:
         cache_window = model.args.sliding_window
+
     cache = RotatingBufferCache(
         model.n_local_layers,
         model.args.max_batch_size,
-        cache_window,
-        model.args.n_kv_heads,
-        model.args.n_heads,
+        cache_window, #4096 
+        # parallel changes
+        model.args.n_kv_heads // model.args.world_size,
+        model.args.n_heads // model.args.world_size,
         model.args.head_dim,
     )
+
     cache.to(device=model.device, dtype=model.dtype)
     cache.reset()
     xm.mark_step()
@@ -80,8 +83,7 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
         assert B == len(seqlens) == len(prompts)
         # x will be reshaped to [B, chunk_size] in model
         x = torch.tensor(sum(prompt_chunks,[]), device=model.device, dtype=torch.long)
-        (num_toks,) = x.shape
-
+        (seqlens_sum,) = x.shape
         prelogits = model.forward(
             x,
             seqlens=[len(p) for p in prompt_chunks],
@@ -103,7 +105,7 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
             offset += len(sequence)
 
         # for all batches
-        assert prelogits.shape == (num_toks,V)
+        assert prelogits.shape == (seqlens_sum,V)
         # select last tok for all prompts
         last_token_prelogits = prelogits.index_select(0, torch.tensor([len(p) for p in prompt_chunks], device=prelogits.device).cumsum(dim=0) - 1)
         assert last_token_prelogits.shape == (B, V)
@@ -169,13 +171,13 @@ def interactive(model_path: str = '/home/minjunes/mistral-src/mistral-7B-v0.1', 
 
 def _accelerate(idx,  model_path: str = '/home/minjunes/mistral-src/mistral-7B-v0.1', max_tokens: int = 35, temperature: float = 0, num_pipeline_ranks : int =1):
     rank, world_size = setup_model_parallel()
-    #weights = load_split_weights(model_path, world_size)
+    weights = load_split_weights(model_path, world_size)
     device = xm.xla_device()
     xm.master_print("tokenizing")
     tokenizer = Tokenizer(str(Path(model_path) / "tokenizer.model"))
     xm.master_print("loading transformer")
     transformer = Transformer.from_folder(
-        Path(model_path), rank, world_size, max_batch_size=3, device=device, dtype=torch.bfloat16
+        weights[rank], Path(model_path), rank, world_size, max_batch_size=3, device=device, dtype=torch.bfloat16
         )
     xm.master_print("generating")
     res, _logprobs = generate(
@@ -225,7 +227,7 @@ def load_split_weights(folder, world_size):
                 res[i][key] = value
     return res
 
-def mp_main(model_path: str = '/home/minjunes/mistral-src/mistral-7B-v0.1', max_tokens: int = 35, temperature: float = 0, num_pipeline_ranks=1):
+def mp_main(model_path: str = '/home/minjunes/mistral-src/mistral-7B-v0.1', max_tokens: int = 4096, temperature: float = 0, num_pipeline_ranks=1):
     xmp.spawn(_accelerate, args=(model_path, max_tokens,temperature,num_pipeline_ranks))
 
 if __name__ == "__main__":

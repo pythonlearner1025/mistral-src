@@ -80,11 +80,9 @@ class Attention(nn.Module):
         self.repeats = self.n_heads // self.n_kv_heads
 
         self.scale = self.args.head_dim**-0.5
-        # args.dim = dim for each token
-        #self.wq = nn.Linear(args.dim, args.n_heads * args.head_dim, bias=False)
         self.wq = ColumnParallelLinear( # shape (B, args.dim // world_size, args.n_heads*args.head_dim)
             args.dim,
-            args.n_heads * args.head_dim,
+            args.n_heads * args.head_dim, # split
             bias=False,
             gather_output=False,
             init_method=lambda x:x,
@@ -93,10 +91,9 @@ class Attention(nn.Module):
             groups=args.groups,
             quant=args.quant,
         )
-        #self.wk = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
         self.wk = ColumnParallelLinear(
             args.dim,
-            args.n_kv_heads * args.head_dim,
+            args.n_kv_heads * args.head_dim, # split
             bias=False,
             gather_output=False,
             init_method=lambda x:x,
@@ -106,10 +103,9 @@ class Attention(nn.Module):
             quant=args.quant,
         )
 
-        #self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
         self.wv = ColumnParallelLinear(
             args.dim,
-            args.n_kv_heads * args.head_dim,
+            args.n_kv_heads * args.head_dim, # split
             bias=False,
             gather_output=False,
             init_method=lambda x:x,
@@ -118,10 +114,9 @@ class Attention(nn.Module):
             groups=args.groups,
             quant=args.quant,)
 
-        #self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
-        # equiv to all attention from n_heads concatenated together to predict final logits
+        # This is where we "reduce output"
         self.wo = RowParallelLinear(
-            args.n_heads * args.head_dim, # shape (B,args.dim//world_size,args.n_heads*args.head_dim)
+            args.n_heads * args.head_dim, # split
             args.dim,
             bias=False,
             input_is_parallel=True,
@@ -131,12 +126,12 @@ class Attention(nn.Module):
             groups=None,
             quant=args.quant,
         )
-        xm.master_print('wq wo shape')
-        xm.master_print(self.wq.weight.shape)
-        xm.master_print(self.wo.weight.shape)
-        assert self.wq.weight.shape == (args.dim // world_size, args.n_heads*args.head_dim)
+        assert self.wq.weight.shape == (args.dim // args.world_size, args.n_heads*args.head_dim)
         assert self.wo.weight.shape == (args.n_heads*args.head_dim, args.dim//args.world_size,)
-
+    
+    # each model has access to 1/8th of parameters
+    # for q,k,v they are parameters at dim(-2)
+    # cache should have 1/8th the size, 
     def forward(
         self,
         x: torch.Tensor,
@@ -146,71 +141,73 @@ class Attention(nn.Module):
         # at enc, seqlen_sum == num_toks (all combined)
         seqlen_sum, dim = x.shape
         assert dim == self.args.dim
-        
+
         # this lin step is performed seperately, by each core
+        # self.wq.weight == (512, 4096)
+        # self.wk.weight == (128, 4096)
+        # self.wv.weight == (128, 4096)
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        # NOTE 
-        # due to gather_all sync step in the forward of parallel linear layers,
-        # i would expect xq, xk, xv's shape to be equal to non-parallel shapes
 
         xm.master_print('q k v shape')
         xm.master_print(xq.shape) # (seqlen_sum, args.head_dim//world_size * args.n_heads)
         xm.master_print(xk.shape) # (seqlen_sum, args.head_dim//world_size * args.n_kv_heads)
         xm.master_print(xv.shape) # (seqlen_sum, args.head_dim//world_size * args.n_kv_heads)
 
-        xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
-        xk = xk.view(seqlen_sum, self.n_kv_heads, self.head_dim)
-        xv = xv.view(seqlen_sum, self.n_kv_heads, self.head_dim)
+        world_sz = self.args.world_size
+
+        xq = xq.view(seqlen_sum, self.n_heads//world_sz, self.head_dim)
+        xk = xk.view(seqlen_sum, self.n_kv_heads//world_sz, self.head_dim)
+        xv = xv.view(seqlen_sum, self.n_kv_heads//world_sz, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        if cache is None:
-            key, val = xk, xv
         # enc
-        elif cache.prefill:
+        if cache.prefill:
+            # when not chunking, key, val == xk, xv
             key, val = cache.interleave_kv(xk, xv)
+            assert (key-xk).sum() == 0 and (val-xv).sum() == 0
+            # NOTE not true when chunking
+            assert key.shape[0] == val.shape[0] == seqlen_sum
             cache.update(xk, xv)
         # dec
         else:
-            assert seqlen_sum == 1
             cache.update(xk, xv)
             key, val = cache.key, cache.value
+            # each new seq of each batch has context of 4096 toks
+            # assert seqlen_sum == B == len(prompts)
             key = key.view(
-                seqlen_sum * cache.sliding_window, self.n_kv_heads, self.head_dim
+                seqlen_sum * cache.sliding_window, self.n_kv_heads // world_sz, self.head_dim
             )
             val = val.view(
-                seqlen_sum * cache.sliding_window, self.n_kv_heads, self.head_dim
+                seqlen_sum * cache.sliding_window, self.n_kv_heads // world_sz, self.head_dim
             )
 
         # Repeat keys and values to match number of query heads
         key, val = repeat_kv(key, val, self.repeats, dim=1)
 
-        scores = torch.matmul(xq, xk.transpose(1,2)) / self.scale
+        # TODO
+        # during decoding, key.shape != xq.shape
+        scores = torch.matmul(xq, key.transpose(1,2)) / self.scale
+        # scores shape
+        # (seqlen, 4, 1)
+        
+        # mask shape WRONG
+        # (4, seqlen, seqlen)
 
-        # add mask
-        mask = cache.mask.transpose(2,0,1)
-        xm.master_print(f'cache_mask shape {mask.shape}')
-        scores += mask 
-        # mask should be zeros and neg infs
+        # at encoding, we don't need mask
+        xm.master_print(f'cache_mask shape {cache.mask.shape}')
+        scores += cache.mask 
         scores = scores.softmax(-1)
-        output = torch.matmul(scores, values)
+        output = torch.matmul(scores, val)
 
-        '''
-        xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
-        # TODO torch_xla incompile this, implement fast attention? 
-        output = memory_efficient_attention(
-            xq, key, val, None if cache is None else cache.mask
-        )
-        '''
-        assert self.n_heads * self.heads_dim == self.args.dim # 4096
-        out = self.wo(output.view(seqlen_sum, self.n_heads * self.head_dim))
-        return out # (num_toks, self.args.dim)
+        # the all_reduce step in forward of wo adds all outs together
+        out = self.wo(output.view(seqlen_sum, (self.n_heads // world_sz) * self.head_dim))
+        return out # (num_toks, self.args.dim // world_size)
 
 
 class FeedForward(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
     
-        #self.w1 = nn.Linear(args.dim, args.hidden_dim, bias=False)
         self.w1 = ColumnParallelLinear(args.dim,
                                        args.hidden_dim,
                                        bias=False,
@@ -221,7 +218,6 @@ class FeedForward(nn.Module):
                                        groups=args.groups,
                                        quant=args.quant)
 
-        #self.w2 = nn.Linear(args.hidden_dim, args.dim, bias=False)
         self.w2 = RowParallelLinear(args.hidden_dim,
                                     args.dim,
                                     bias=False,
@@ -232,7 +228,6 @@ class FeedForward(nn.Module):
                                     groups=args.groups,
                                     quant=args.quant)
 
-        #self.w3 = nn.Linear(args.dim, args.hidden_dim, bias=False)
         self.w3 = ColumnParallelLinear(args.dim,
                                        args.hidden_dim,
                                        bias=False,
@@ -288,7 +283,6 @@ class TransformerBlock(nn.Module):
         h = x + r
         r = self.feed_forward.forward(self.ffn_norm(h))
         out = h + r
-        # out.shape == [num_toks, args.dim]
         return out
 
 
@@ -498,7 +492,7 @@ class Transformer(nn.Module):
 
     @staticmethod
     def from_folder(
-        #weight,
+        weight,
         folder: Path,
         rank: int,
         world_size: int,
@@ -515,10 +509,10 @@ class Transformer(nn.Module):
             model_args = ModelArgs.from_dict(args)
         model_args.max_batch_size = max_batch_size
         xm.master_print(f'loading model... rank: {rank} world sz: {world_size}')
-        model = Transformer(model_args, pipeline_rank=rank, num_pipeline_ranks=world_size)
+        model = Transformer(model_args) #pipeline_rank=rank, num_pipeline_ranks=world_size)
         # mmap = True removed, now throwing err
         #loaded = torch.load(str(folder / "consolidated.00.pth"), map_location='cpu')
         # assign = True removed, now throwing err
-        loaded = torch.load(str(folder / "consolidated.00.pth"))
+        #loaded = torch.load(str(folder / "consolidated.00.pth"))
         model.load_state_dict(weight)
         return model.to(device=device, dtype=dtype)
