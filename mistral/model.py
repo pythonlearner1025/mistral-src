@@ -183,11 +183,12 @@ class Attention(nn.Module):
 
         # Repeat keys and values to match number of query heads
         key, val = repeat_kv(key, val, self.repeats, dim=1)
-
+        xm.master_print(f'key {key.shape} val {val.shape}')
         # TODO
-        # during decoding, key.shape != xq.shape
+        # during decoding, key.shape != xq.shape and val.shape != xq.shape
+        # in normal attention, i think u expand the dims 
         scores = torch.matmul(xq, key.transpose(1,2)) / self.scale
-        # scores shape
+        # scores shape == (seqlen, self.n_heads // world_sz, self.n_kv_heads // world_sz)
         # (seqlen, 4, 1)
         
         # mask shape WRONG

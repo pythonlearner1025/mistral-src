@@ -27,8 +27,6 @@ class RotatingCacheInputMetadata:
     mask: AttentionBias
     seqlens: List[int]
 
-
-
 class CacheView:
     def __init__(self, cache_k: torch.Tensor, cache_v: torch.Tensor, metadata: RotatingCacheInputMetadata, kv_seqlens: torch.Tensor):
         self.cache_k = cache_k
@@ -51,7 +49,7 @@ class CacheView:
         #xm.master_print(f'cache pos {self.metadata.cache_positions.shape}')
         #xm.master_print(f'cache mask {self.metadata.cache_mask.shape}') # to mask or not mask each seq. 
                                                                     # only copy items to be masked??
-        assert self.metadata.cache_positions.shape[0] == self.metadata.cache_mask.shape[0]
+        assert self.metadata.cache_positions.shape[0] == self.metadata.to_cache_mask.shape[0]
         flat_cache_k.index_copy_(0, self.metadata.cache_positions, xk[self.metadata.to_cache_mask])
         flat_cache_v.index_copy_(0, self.metadata.cache_positions, xv[self.metadata.to_cache_mask])
 
