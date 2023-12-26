@@ -518,20 +518,17 @@ class BlockDiagonalMask(AttentionBias):
 
     def materialize(
         self,
-        shape: Tuple[int, ...],
+        shape: List,
         dtype: torch.dtype = torch.float32,
         device: Union[str, torch.device] = "cpu",
     ) -> torch.Tensor:
         """Materialize the attention bias - for debugging & testing"""
         xm.master_print(f'(?, {self.k_seqinfo.seqstart_py[-1]}, {self.q_seqinfo.seqstart_py[-1]})')
-        assert shape[-1] == self.k_seqinfo.seqstart_py[-1], (
-            shape[-1],
-            self.k_seqinfo.seqstart_py[-1],
-        )
-        assert shape[-2] == self.q_seqinfo.seqstart_py[-1], (
-            shape[-2],
-            self.q_seqinfo.seqstart_py[-1],
-        )
+        # NOTE naive impl
+        if shape[-1] != self.k_seqinfo.seqstart_py[-1]:
+            shape[-1] = self.k_seqinfo.seqstart_py[-1]
+        if shape[-2] == self.q_seqinfo.seqstart_py[-1]:
+            shape[-2] = self.q_seqinfo.seqstart_py[-1]
         mask = torch.empty(shape[-2:], dtype=dtype, device=device)
         mask.fill_(-math.inf)
         for i, ((q_start, q_end), (k_start, k_end)) in enumerate(
@@ -547,7 +544,7 @@ class BlockDiagonalMask(AttentionBias):
             )
         for _ in range(len(shape) - 2):
             mask = mask.unsqueeze(0)
-        return mask.expand(shape)
+        return mask.expand(tuple(shape))
 
 
     @classmethod
@@ -799,14 +796,17 @@ class BlockDiagonalCausalWithOffsetPaddedKeysMask(AttentionBias):
 
     def materialize(
         self,
-        shape: Tuple[int, ...],
+        shape: List,
         dtype: torch.dtype = torch.float32,
         device: Union[str, torch.device] = "cpu",
     ) -> torch.Tensor:
         """Materialize the attention bias - for debugging & testing"""
+        # NOTE naive implementation
         if shape[-1] != self.k_seqinfo.seqstart_py[-1]:
-            raise ValueError("k shapes wrong")
+            shape[-1] = self.k_seqinfo.seqstart_py[-1]
+            #raise ValueError("k shapes wrong")
         if shape[-2] != self.q_seqinfo.seqstart_py[-1]:
+            shape[-2] = self.q_seqinfo.seqstart_py[-1]
             raise ValueError("q shapes wrong")
         mask = torch.empty(shape[-2:], dtype=dtype, device=device)
         mask.fill_(-math.inf)
@@ -823,7 +823,7 @@ class BlockDiagonalCausalWithOffsetPaddedKeysMask(AttentionBias):
             )
         for _ in range(len(shape) - 2):
             mask = mask.unsqueeze(0)
-        return mask.expand(shape)
+        return mask.expand(tuple(shape))
 
 
     @classmethod

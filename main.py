@@ -13,7 +13,7 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 
 from mistral.xla_model_parallel import get_model_parallel_rank, get_model_parallel_world_size
 from typing import *
-import re
+import re, time
 
 def sample_top_p(probs: torch.Tensor, p: float):
     assert 0 <= p <= 1
@@ -126,8 +126,15 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
         # if i_token == 0, next_token == last tok of prompt
         # cache contains K,V context of all prompts 
         # next_tok is used as Q
+        s = time.perf_counter()
         last_token_prelogits = model.forward(next_token, seqlens=[1] * len(prompts), cache=cache)
-        xm.mark_step()
+        e = time.perf_counter()
+        xm.master_print(f'one forward tm {(e-s)*1000:7.2f}')
+
+        s = time.perf_counter()
+        #xm.mark_step()
+        e = time.perf_counter()
+        xm.master_print(f'mark step tm {(e-s)*1000:7.2f}')
         assert last_token_prelogits.shape == (B, V)
 
     generated_words = []

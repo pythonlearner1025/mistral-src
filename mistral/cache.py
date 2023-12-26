@@ -3,6 +3,8 @@ from typing import List, Tuple
 from dataclasses import dataclass
 import torch_xla.core.xla_model as xm
 
+import time
+
 from .mask_utils import (
     AttentionBias,
     BlockDiagonalCausalMask,
@@ -187,7 +189,10 @@ class RotatingBufferCache:
 
     # called in forward
     def update_seqlens(self, seqlens: List[int]):
+        s = time.perf_counter()
         self.kv_seqlens += torch.tensor(seqlens, device=self.device, dtype=torch.long)
+        e = time.perf_counter()
+        xm.master_print(f'seqlens update tm {(e-s)*1000:7.2f}')
 
     # when embedding prompt for first time, 
     # first prefill = True
@@ -240,10 +245,11 @@ class RotatingBufferCache:
         if first_prefill:
             assert all([pos == 0 for pos in seqpos]), (seqpos)
             mask = BlockDiagonalCausalMask.from_seqlens(seqlens).make_local_attention(self.sliding_window)
-            shape = (self.n_heads, sum(seqlens), sum(seqlens))
-            xm.master_print(f'seqlens {sum(seqlens)}')
+            shape = [self.n_heads, sum(seqlens), sum(seqlens)]
+            #xm.master_print(f'seqlens {sum(seqlens)}')
             mask = mask.materialize(shape, device=self.device, dtype=torch.bfloat16)
-            xm.master_print(f'made mask shape {mask.shape}')
+            #xm.master_print(f'made mask shape {mask.shape}')
+            #xm.master_print(f'mask looks like: {mask[0]}')
 
         # subsequent encodings
         # unless we set chunk_size, this is never called
@@ -264,7 +270,7 @@ class RotatingBufferCache:
                                             # inc by 1              # max seq size == W (4096)
                 kv_seqlen=(self.kv_seqlens + cached_elements).clamp(max=self.sliding_window).tolist()
             )
-            shape = (self.n_heads, self.n_kv_heads, sum(seqlens))
+            shape = [self.n_heads, sum(seqlens), sum(seqlens)]
             mask = mask.materialize(shape, device=self.device, dtype=torch.bfloat16)
 
         return RotatingCacheInputMetadata(

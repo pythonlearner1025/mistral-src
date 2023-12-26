@@ -188,7 +188,6 @@ def my_gather(input_: torch.Tensor, groups, world_size, rank) -> torch.Tensor:
                                                             padding), "sum",
                                                       TAG, RANKSET, GROUP_SIZE)
     else:
-        xm.master_print(f'before all gather shape {input_.shape}')
         output = xm.all_gather(input_, dim=-1, groups=groups)
 
     xm.master_print(f'after all gather shape {output.shape}')

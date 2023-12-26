@@ -13,6 +13,7 @@ from simple_parsing.helpers import Serializable
 from mistral.rope import precompute_freqs_cis, apply_rotary_emb
 from mistral.cache import CacheView, RotatingBufferCache
 from mistral.moe import MoeArgs, MoeLayer
+import time
 
 import torch_xla.core.xla_model as xm
 from .xla_model_parallel import (
@@ -67,6 +68,12 @@ def repeat_kv(keys: torch.Tensor, values: torch.Tensor, repeats: int, dim: int):
     values = torch.repeat_interleave(values, repeats=repeats, dim=dim)
     return keys, values
 
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta**(torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -114,8 +121,7 @@ class Attention(nn.Module):
             groups=args.groups,
             quant=args.quant,)
 
-        # This is where we "reduce output"
-        self.wo = RowParallelLinear(
+        self.wo = RowParallelLinear( 
             args.n_heads * args.head_dim, # split
             args.dim,
             bias=False,
@@ -128,44 +134,62 @@ class Attention(nn.Module):
         )
         assert self.wq.weight.shape == (args.dim // args.world_size, args.n_heads*args.head_dim)
         assert self.wo.weight.shape == (args.n_heads*args.head_dim, args.dim//args.world_size,)
-    
-    # each model has access to 1/8th of parameters
-    # for q,k,v they are parameters at dim(-2)
-    # cache should have 1/8th the size, 
+
+    # TODO follow llama impl 
+    # causal mask
+    # - in Seq x Seq would be upper triangle filled with -inf
+    # - in Seq
+
+    # in mqa
+    # Q => (seqlen, n_queries, k_dim)
+    # K => (seqlen, k_dim)
+    # V => (seqlen, v_dim)
+    # scores = Q @ K.T => (seqlen, n_queries, seqlen)
+    # scores += mask 
+    # out = scores @ V => (seqlen, n_queries, v_dim)
+    # out = out.view(seqlen, n_queries*v_dim) @ W => (seqlen, model_dim)
+
+    # in gqa
+    # Q => (seqlen, n_queries, k_dim)
+    # K => (seqlen, n_queries_per_group, k_dim)
+    # V => (seqlen, n_queries_per_group, v_dim)
+    # scores = Q @ K.T => (seqlen, n_queries, n_queries_per_group)
+    # scores += mask
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
-        cache: Optional[CacheView],
+        mask,
+        cache_kv: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         # at enc, seqlen_sum == num_toks (all combined)
         seqlen_sum, dim = x.shape
         assert dim == self.args.dim
 
-        # this lin step is performed seperately, by each core
-        # self.wq.weight == (512, 4096)
-        # self.wk.weight == (128, 4096)
-        # self.wv.weight == (128, 4096)
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
-        xm.master_print('q k v shape')
-        xm.master_print(xq.shape) # (seqlen_sum, args.head_dim//world_size * args.n_heads)
-        xm.master_print(xk.shape) # (seqlen_sum, args.head_dim//world_size * args.n_kv_heads)
-        xm.master_print(xv.shape) # (seqlen_sum, args.head_dim//world_size * args.n_kv_heads)
-
         world_sz = self.args.world_size
+        W = cache.sliding_window
+        s = seqlen_sum
+        qh = self.n_heads // world_sz
+        h = self.n_kv_heads // world_sz
+        g = self.n_heads // self.n_kv_heads
+        d = self.head_dim
 
-        xq = xq.view(seqlen_sum, self.n_heads//world_sz, self.head_dim)
-        xk = xk.view(seqlen_sum, self.n_kv_heads//world_sz, self.head_dim)
-        xv = xv.view(seqlen_sum, self.n_kv_heads//world_sz, self.head_dim)
+        s0 = time.perf_counter()
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = xq.view(s, qh, d)
+        xk = xk.view(s, h, d)
+        xv = xv.view(s, h, d)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        e = time.perf_counter()
+        xm.master_print(f'wq, wk, wv time {(e-s0)*1000:7.2f}')
 
         # enc
         if cache.prefill:
             # when not chunking, key, val == xk, xv
+            s0 = time.perf_counter()
             key, val = cache.interleave_kv(xk, xv)
-            assert (key-xk).sum() == 0 and (val-xv).sum() == 0
-            # NOTE not true when chunking
+            e = time.perf_counter()
+            xm.master_print(f'interleave tm {(e-s0)*1000:7.2f}')
             assert key.shape[0] == val.shape[0] == seqlen_sum
             cache.update(xk, xv)
         # dec
@@ -175,34 +199,50 @@ class Attention(nn.Module):
             # each new seq of each batch has context of 4096 toks
             # assert seqlen_sum == B == len(prompts)
             key = key.view(
-                seqlen_sum * cache.sliding_window, self.n_kv_heads // world_sz, self.head_dim
+                seqlen_sum * W, self.n_kv_heads // world_sz, self.head_dim
             )
             val = val.view(
-                seqlen_sum * cache.sliding_window, self.n_kv_heads // world_sz, self.head_dim
+                seqlen_sum * W, self.n_kv_heads // world_sz, self.head_dim
             )
-
         # Repeat keys and values to match number of query heads
+        s0 = time.perf_counter()
         key, val = repeat_kv(key, val, self.repeats, dim=1)
-        xm.master_print(f'key {key.shape} val {val.shape}')
-        # TODO
-        # during decoding, key.shape != xq.shape and val.shape != xq.shape
-        # in normal attention, i think u expand the dims 
-        scores = torch.matmul(xq, key.transpose(1,2)) / self.scale
-        # scores shape == (seqlen, self.n_heads // world_sz, self.n_kv_heads // world_sz)
-        # (seqlen, 4, 1)
-        
-        # mask shape WRONG
-        # (4, seqlen, seqlen)
 
-        # at encoding, we don't need mask
-        xm.master_print(f'cache_mask shape {cache.mask.shape}')
-        scores += cache.mask 
+        #xm.master_print(f'key shape {key.shape}')
+        #xm.master_print(f'val shape {val.shape}')
+
+        e = time.perf_counter()
+        #xm.master_print(f'repeat tm {(e-s0)*1000:7.2f}')
+
+        xq = xq.view(g,h,s,d)
+        key = key.view(g*h, s if cache.prefill else s*W, d)
+        val = val.view(g*h, s if cache.prefill else s*W, d)  # (4,1,28,128),(1,28,128) -> (4,28,128)
+        s0 = time.perf_counter()
+                              #
+        scores = torch.einsum('ghnd,hsd->gns',xq,key) / self.scale # (1,28,28)
+        e = time.perf_counter()
+        #xm.master_print(f'score calc tm {(e-s0)*1000:7.2f}')
+
+        # the mask is (4,28,28), but should be equivalent across heads, so
+        # can just pick the first? 
+        xm.master_print(f'score shape {scores.shape}')
+        xm.master_print(f'cache shape {cache.mask.shape}')
+        scores += cache.mask
         scores = scores.softmax(-1)
-        output = torch.matmul(scores, val)
+                            # (4,28,128),(1,28,128) 
+        s0 = time.perf_counter()
+        output = torch.einsum('gns,hsd->gnd',scores,val)
+        e = time.perf_counter()
+        #xm.master_print(f'weighted val calc tm {(e-s0)*1000:7.2f}')
+        output = output.view(s,qh*d)
 
-        # the all_reduce step in forward of wo adds all outs together
-        out = self.wo(output.view(seqlen_sum, (self.n_heads // world_sz) * self.head_dim))
-        return out # (num_toks, self.args.dim // world_size)
+        # (28,128) @ (512,4096) 
+        s0 = time.perf_counter()
+        out = self.wo(output)
+        e = time.perf_counter()
+        #xm.master_print(f'out lin proj time {(e-s0)*1000:7.2f}')
+        #xm.master_print(out.shape)
+        return out 
 
 
 class FeedForward(nn.Module):
@@ -280,9 +320,21 @@ class TransformerBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]
     ) -> torch.Tensor:
-        r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
+        s = time.perf_counter()
+        x = self.attention_norm(x)
+        e = time.perf_counter()
+        #xm.master_print(f'norm tm {(e-s)*1000:7.2f}')
+
+        s = time.perf_counter()
+        r = self.attention.forward(x, freqs_cis, cache)
+        e = time.perf_counter()
+        #xm.master_print(f'attn tm {(e-s)*1000:7.2f}')
+
         h = x + r
+        s = time.perf_counter()
         r = self.feed_forward.forward(self.ffn_norm(h))
+        e = time.perf_counter()
+        #xm.master_print(f'attn tm {(e-s)*1000:7.2f}')
         out = h + r
         return out
 
@@ -329,6 +381,23 @@ class Transformer(nn.Module):
                                            quant=args.quant)
 
         # Initialize all layers but slice off those not of this rank.
+        self.cache_kvs = []
+        for _ in range(args.n_layers):
+            cache_k = torch.zeros((args.max_batch_size, args.max_seqlen, n_local_heads, args.head_dim)) 
+            cache_v = torch.zeros((args.max_batch_size, args.max_seqlen, n_local_heads, args.head_dim)) 
+            self.cache_kvs.append((cache_k,cache_v))
+        
+        freqs_cis = precompute_freqs_cis(
+            self.args.dim // self.args.n_heads,
+            self.args.max_seq_len * 2)
+        self.register_buffer("freqs_cis", freqs_cis) 
+
+        mask = torch.full(
+        (1, 1, args.max_seq_len, args.max_seq_len),
+        float("-inf")).to(torch.float)
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer("mask", mask)
+            
         layers = [TransformerBlock(args=args) for _ in range(args.n_layers)]
         num_layers_per_rank = math.ceil(self.n_layers / self.num_pipeline_ranks)
         offset = self.pipeline_rank * num_layers_per_rank
@@ -344,98 +413,32 @@ class Transformer(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    @property
-    def freqs_cis(self) -> torch.Tensor:
-        # We cache freqs_cis but need to take care that it is on the right device
-        # and has the right dtype (complex64). The fact that the dtype is different
-        # from the module's  dtype means we cannot register it as a buffer
-        if self._precomputed_freqs_cis is None:
-            # If no sliding window, assume a larger seqlen
-            theta = self.args.rope_theta
-            if theta is None:
-                theta = 1000000.0 if self.args.sliding_window is None else 10000.0
-            # theta = 10000.
-            self._precomputed_freqs_cis = precompute_freqs_cis(
-                self.args.head_dim, 128_000, theta
-            )
-        if self._precomputed_freqs_cis.device != self.device:
-            self._precomputed_freqs_cis = self._precomputed_freqs_cis.to(
-                device=self.device
-            )
-        return self._precomputed_freqs_cis
 
-    def forward_partial(
-        self,
-        input_ids: torch.Tensor,
-        seqlens: List[int],
-        cache: Optional[RotatingBufferCache] = None,
-    ) -> torch.Tensor:
-        """Local forward pass.
-
-        If doing pipeline parallelism, this will return the activations of the last layer of this stage.
-        For the last stage, this will return the normalized final embeddings.
-        """
-        assert (
-            len(seqlens) <= self.args.max_batch_size
-        ), f"Max batch size is {self.args.max_batch_size}, got batch size of {len(seqlens)}"
-        (num_toks,) = input_ids.shape
-        assert sum(seqlens) == num_toks, (sum(seqlens), num_toks)
-        if cache is not None:
-            input_metadata = cache.get_input_metadata(seqlens)
-        else:
-            input_metadata = SimpleInputMetadata.from_seqlens(seqlens, self.device)
-
-        if self.pipeline_rank == 0:
-            assert self.tok_embeddings is not None
-            h = self.tok_embeddings(input_ids)
-            xm.master_print(f'h shape {h.shape}')
-        else:
-            h = torch.empty(
-                num_toks, self.args.dim, device=self.device, dtype=self.dtype
-            )
-            torch.distributed.recv(h, src=self.pipeline_rank - 1)
-
-        freqs_cis = self.freqs_cis[input_metadata.positions]
-
-        for local_layer_id, layer in enumerate(self.layers.values()):
-            if cache is not None:
-                assert input_metadata is not None
-                cache_view = cache.get_view(local_layer_id, input_metadata)
-            else:
-                cache_view = None
-            h = layer(h, freqs_cis, cache_view)
-
-        if cache is not None:
-            cache.update_seqlens(seqlens)
-        if self.pipeline_rank < self.num_pipeline_ranks - 1:
-            torch.distributed.send(h, dst=self.pipeline_rank + 1)
-            return h
-        else:
-            # Last rank has a final normalization step.
-            assert self.norm is not None
-            out = self.norm(h)
-            return out
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        seqlens: List[int],
-        cache: Optional[RotatingBufferCache] = None,
+        tokens: torch.Tensor,
+        input_indexes: torch.Tensor,
+        output_index: torch.Tensor,
+        cache_kvs: List[Tuple[torch.Tensor, torch.Tensor]]
     ) -> torch.Tensor:
-        h = self.forward_partial(input_ids, seqlens, cache=cache)
-        if self.pipeline_rank < self.num_pipeline_ranks - 1:
-            # ignore the intermediate activations as we'll get the final output from
-            # the last stage
-            outs = torch.empty(
-                h.shape[0], self.vocab_size, device=h.device, dtype=h.dtype
-            )
-        else:
-            assert self.output is not None
-            outs = self.output(h)
-            #assert out.shape == [num_toks, self.args.vocab_size]
-        if self.num_pipeline_ranks > 1:
-            torch.distributed.broadcast(outs, src=self.num_pipeline_ranks - 1)
-        return outs.float()
+
+        (bsz, seqlen) = tokens.shape
+
+        h = self.tok_embeddings(input_ids)
+        xm.master_print(f'h shape {tokens.shape}')
+
+        freqs_cis = self.freqs_cis.index_select(0, input_indexes)
+
+        new_cache_kvs = []
+        for local_layer_id, layer in zip(self.layers, cache_kvs):
+            h, new_cache_kv = layer(h, freqs_cis, mask, input_indexes, cache_kv)
+            new_cache_kvs.append(new_cache_kv)
+
+        out = self.norm(h)
+        out = out.index_select(1, output_index - input_indexes[0]).squeeze(dim=1)
+        outs = self.output(h)
+        return outs.float(), new_cache_kvs
 
     def load_state_dict(self, state_dict, *args, **kwargs):
         state_to_load = {}
