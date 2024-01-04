@@ -12,36 +12,25 @@ from torch.nn.parameter import Parameter
 from fairscale.nn.model_parallel.utils import divide_and_check_no_remainder, split_tensor_along_last_dim
 
 import os
-
-USE_CUDA = os.environ.get('USE_CUDA', False)
-
-# Some how xla init will slow down the CUDA speed.
-if not USE_CUDA:
-    import torch_xla.core.xla_model as xm
+import torch_xla.core.xla_model as xm
 
 TAG = None
 RANKSET = None
 GROUP_SIZE = None
-
 
 def set_g_group():
     global TAG
     global RANKSET
     global GROUP_SIZE
 
-    assert USE_CUDA, "This hack is only for PyTorch non-XLA CUDA paths, i.e., eager and inductor."
     TAG, RANKSET, GROUP_SIZE = fc._expand_group(c10d._get_default_group())
 
 
 def get_model_parallel_rank():
-    if USE_CUDA:
-        return dist.get_rank()
     return xm.get_ordinal()
 
 
 def get_model_parallel_world_size():
-    if USE_CUDA:
-        return dist.get_world_size()
     return xm.xrt_world_size()
 
 
@@ -140,12 +129,7 @@ def my_reduce(input_: torch.Tensor, groups, world_size, rank) -> torch.Tensor:
     if world_size == 1:
         return input_
 
-    # All-reduce.
-    if USE_CUDA:
-        input_ = torch.ops.c10d_functional.all_reduce(input_, "sum", TAG,
-                                                      RANKSET, GROUP_SIZE)
-    else:
-        input_ = xm.all_reduce(xm.REDUCE_SUM, input_, groups=groups)
+    input_ = xm.all_reduce(xm.REDUCE_SUM, input_, groups=groups)
 
     return input_
 
@@ -172,23 +156,7 @@ def my_gather(input_: torch.Tensor, groups, world_size, rank) -> torch.Tensor:
     if world_size == 1:
         return input_
 
-    if USE_CUDA:
-        last_dim = input_.dim() - 1
-
-        # Using all_reduce to achieve all_gather as torch.ops.c10d_functional.all_gather_into_tensor
-        # is buggy in 16 bits.
-        size = input_.size(last_dim)
-        padding = [0] * (2 * input_.dim())
-        ordinal = rank
-        left, right = ordinal, world_size - 1 - ordinal
-        idx = input_.dim() - 1 - last_dim
-        padding[2 * idx] = left * size
-        padding[2 * idx + 1] = right * size
-        output = torch.ops.c10d_functional.all_reduce(F.pad(input_,
-                                                            padding), "sum",
-                                                      TAG, RANKSET, GROUP_SIZE)
-    else:
-        output = xm.all_gather(input_, dim=-1, groups=groups)
+    output = xm.all_gather(input_, dim=-1, groups=groups)
 
     xm.master_print(f'after all gather shape {output.shape}')
     return output
@@ -433,6 +401,9 @@ class ColumnParallelLinear(torch.nn.Module):
             output_parallel = F.linear(input_parallel, self.weight, self.bias)
             output_parallel = output_parallel * self.weight_scaler
         else:
+            xm.master_print(f'input dev {input_parallel.device}')
+            xm.master_print(f'weight dev {self.weight.device}')
+            #xm.master_print(f'bias dev {self.bias.device}')
             output_parallel = F.linear(input_parallel, self.weight, self.bias)
         if self.gather_output:
             # All-gather across the partitions.
